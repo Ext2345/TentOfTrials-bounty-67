@@ -193,13 +193,18 @@ def diagnostic_relative_path(path: Path, root: Path = ROOT) -> str:
 def redact_diagnostic_text(value: object, root: Path = ROOT) -> str:
     """Remove host identity and absolute filesystem paths from report text."""
     text = str(value)
-    replacements = [
-        (str(root.resolve()), "<REPO>", False),
-        (str(Path.home().resolve()), "<HOME>", False),
-        (str(Path(tempfile.gettempdir()).resolve()), "<TEMP>", False),
+    replacements = []
+    for local_path, label in ((root, "<REPO>"), (Path.home(), "<HOME>"),
+                              (Path(tempfile.gettempdir()), "<TEMP>")):
+        # Keep the lexical spelling as well as symlink-resolved paths. On macOS
+        # /var and /private/var can name the same location; either may be logged.
+        spellings = {str(local_path), str(local_path.resolve())}
+        replacements.extend((spelling, label, False)
+                            for spelling in sorted(spellings, key=len, reverse=True))
+    replacements.extend([
         (platform.node(), "<HOST>", True),
         (getpass.getuser(), "<USER>", True),
-    ]
+    ])
     # Match both slash styles even when the report came from a different OS.
     for path, replacement, identity in replacements:
         if path:
@@ -261,6 +266,8 @@ def validate_diagnostic_artifact_pair(
     require_logd: bool = True,
 ) -> list[Path]:
     """Validate that a report and every .logd it names form a real pair."""
+    if metadata_path.is_symlink():
+        raise ValueError("diagnostic metadata must not be a symbolic link")
     if not metadata_path.is_file():
         raise ValueError(f"diagnostic metadata is missing: {diagnostic_relative_path(metadata_path, root)}")
     try:
@@ -270,20 +277,36 @@ def validate_diagnostic_artifact_pair(
     if not isinstance(report, dict):
         raise ValueError("diagnostic metadata must contain a JSON object")
 
+    diagnostic_dir = root.resolve() / "diagnostic"
+    if metadata_path.resolve().parent != diagnostic_dir:
+        raise ValueError("diagnostic metadata must be directly inside diagnostic/")
+    match = re.fullmatch(r"build-([0-9a-fA-F]{8})(?:-metadata)?\.json", metadata_path.name)
+    if not match:
+        raise ValueError("diagnostic metadata filename must identify the build commit")
+    commit_id = match.group(1)
+    if report.get("commit", commit_id) != commit_id:
+        raise ValueError("diagnostic metadata commit does not match its filename")
+
     entry = report.get("diagnostic_logd")
     names = [] if entry is None else ([entry] if isinstance(entry, str) else entry)
     if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
         raise ValueError("diagnostic metadata has an invalid diagnostic_logd value")
     artifacts = []
     for name in names:
-        if ("\\" in name or Path(name).is_absolute() or PureWindowsPath(name).is_absolute()
+        if ("\\" in name or Path(name).is_absolute() or PureWindowsPath(name).drive
                 or name.startswith("/") or ".." in Path(name).parts):
             raise ValueError("diagnostic metadata must use safe repository-relative slash paths")
-        candidate = (root / Path(name)).resolve()
+        source_path = root / Path(name)
+        if source_path.is_symlink():
+            raise ValueError("diagnostic artifact must not be a symbolic link")
+        candidate = source_path.resolve()
         try:
             candidate.relative_to(root.resolve())
         except ValueError as exc:
             raise ValueError("diagnostic artifact path escapes the repository") from exc
+        if (len(Path(name).parts) != 2 or Path(name).parts[0] != "diagnostic"
+                or candidate.parent != diagnostic_dir):
+            raise ValueError("diagnostic artifact must be directly inside diagnostic/")
         if candidate.suffix != ".logd" or not candidate.is_file():
             raise ValueError(f"diagnostic .logd artifact is missing: {name}")
         if candidate.stat().st_size == 0:
@@ -293,7 +316,12 @@ def validate_diagnostic_artifact_pair(
     if len(artifacts) != len(set(artifacts)):
         raise ValueError("diagnostic metadata contains duplicate .logd artifact paths")
 
-    diagnostic_dir = metadata_path.parent
+    chunked = bool(report.get("chunked")) or len(names) > 1
+    for index, name in enumerate(names, start=1):
+        suffix = f"-part{index:03d}" if chunked else ""
+        if Path(name).name != f"build-{commit_id}{suffix}.logd":
+            raise ValueError("diagnostic artifact commit or ordered chunk sequence is mismatched")
+
     stem = metadata_path.stem.removesuffix("-metadata")
     actual = sorted(diagnostic_dir.glob(f"{stem}*.logd"))
     if names and set(artifacts) != {path.resolve() for path in actual}:
